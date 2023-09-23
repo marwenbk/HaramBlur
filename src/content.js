@@ -1,62 +1,15 @@
-import Human from "@vladmandic/human";
-import plimit from "p-limit";
-
-const modelsUrl = chrome.runtime.getURL("src/assets/models");
-const limit = plimit(10);
-
-// var count = 0;
-const config = {
-	modelBasePath: modelsUrl,
-	// backend: "webgpu",
-	face: {
-		enabled: true,
-		modelPath: "blazeface.json",
-		iris: { enabled: false },
-		mesh: { enabled: false },
-		emotion: { enabled: false },
-		detector: { maxDetected: 3 },
-		// description: { enabled: true, modelPath: "faceres.json" },
-	},
-
-	// disable all other models
-	// except face
-	// to save resources
-	body: {
-		enabled: false,
-	},
-	hand: {
-		enabled: false,
-	},
-	gesture: {
-		enabled: false,
-	},
-	object: {
-		enabled: false,
-	},
-};
-
-var human; // global variable to hold human object
 var mutationObserver;
+var iframeWindow;
 
 const MAX_HEIGHT = 300;
 const MAX_WIDTH = 500;
 const MIN_WIDTH = 100;
 const MIN_HEIGHT = 100;
 
-const initHuman = async () => {
-	console.log("INIT HUMAN", document.readyState);
-	human = new Human(config);
-	await human.load();
-};
-
-initHuman().catch((error) => {
-	console.error("Error initializing Human:", error);
-});
-
 const processNode = (node) => {
 	if (node.tagName === "IMG") {
 		// console.log("IMG TAG", node);
-		limit(() => detectFace(node));
+		detectFace(node);
 		return;
 	}
 
@@ -95,7 +48,7 @@ const loadImage = (img) => {
 				resolve(img);
 			};
 			img.onerror = (e) => {
-				console.error("Failed to load image", img);
+				// console.error("Failed to load image", img);
 				reject(e);
 			};
 		}
@@ -103,49 +56,62 @@ const loadImage = (img) => {
 };
 
 const canvas = document.createElement("canvas");
-const ctx = canvas.getContext("2d");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
 // resize image if it's too big
-const resizeImage = (img) => {
-	if (img.height <= MAX_HEIGHT && img.width <= MAX_WIDTH) return img;
 
-	// resize image if it's too big using canvas
-
-	console.log("resizing");
-	// reset canvas
-	const ratio = Math.min(MAX_WIDTH / img.width, MAX_HEIGHT / img.height);
-	canvas.width = img.width * ratio;
-	canvas.height = img.height * ratio;
-
-	ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-
-	// Create a new image element
-	let resizedImage = new Image();
-	resizedImage.src = canvas.toDataURL();
-
-	img.dataset.resized = true;
-
-	return resizedImage;
+const resizeImageAndReturnData = (img) => {
+	try {
+		// resize image by keeping aspect ratio and return canvas
+		const ratio = Math.min(MAX_WIDTH / img.width, MAX_HEIGHT / img.height);
+		canvas.width = img.width * ratio;
+		canvas.height = img.height * ratio;
+		ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+		const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+		return {
+			data: imageData.data,
+			width: imageData.width,
+			height: imageData.height,
+			imgSrc: img.src,
+		};
+	} catch (error) {
+		console.log("error resizing image", error, img.src);
+	}
 };
 
-const processImage = async (img) => {
-	
-	// resize image if it's too big
-	
+const sendImageToWorker = (imageData, imgSrc) => {
+	// console.log ("image data", imageData)
+	try {
+		if (!iframeWindow) return;
+		iframeWindow.postMessage(
+			{
+				image: imageData.data.buffer,
+				width: imageData.width,
+				height: imageData.height,
+				imgSrc,
+			},
+			"*"
+		);
+	} catch (error) {
+		console.log("error sending image to worker", error, imgSrc);
+	}
+};
+
+const sendImageForProcessing = async (img) => {
 	// check if image is loaded, print error if not
 	let loadedImage = await loadImage(img);
 	if (!loadedImage) {
-		console.error("Failed to load image", img);
+		// console.error("Failed to load image", img);
 		return;
 	}
 	if (isImageTooSmall(loadedImage)) return;
 
 	// resize image if it's too big
-	loadedImage = resizeImage(loadedImage);
+	const imageCanvasData = resizeImageAndReturnData(loadedImage);
+	// send image to worker
+	sendImageToWorker(imageCanvasData, img.src);
+};
 
-	let detections = await human.detect(loadedImage);
-	// console.log("detections", detections);
-	// return;
-
+const processImageAfterReceive = (detections, img) => {
 	if (!detections?.face?.length) {
 		console.log("skipping cause no faces", img);
 		img.dataset.blurred = false;
@@ -183,11 +149,25 @@ const shouldProcessImage = (img) => {
 const detectFace = async (img) => {
 	// somehow mark image as processed
 	// so that it's not processed again
-	if (!shouldProcessImage(img)) return;
+	try {
+		if (!shouldProcessImage(img)) return;
 
-	img.crossOrigin = "anonymous";
+		img.crossOrigin = "anonymous";
 
-	await processImage(img);
+		await sendImageForProcessing(img);
+	} catch (error) {
+		// console.log ("error detecting face", error, img.src)
+	}
+};
+
+const receiveMessage = (event) => {
+	console.log("detections received from worker", event);
+	const imgSrc = event.data.imgSrc;
+	const images = document.querySelector(`img[src="${imgSrc}"]`);
+	if (!images) return;
+	for (let img of images) {
+		processImageAfterReceive(event.data.detections, img);
+	}
 };
 
 const init = async () => {
@@ -201,18 +181,52 @@ const init = async () => {
 	// const imagesArray = Array.from(images);
 	for (let img of images) {
 		// console.log("🚀 ~ file: content.js:261 ~ init ~ img:", img);
-		limit(() => detectFace(img));
+		detectFace(img);
 	}
 
 	mutationObserver.observe(document.body, { childList: true, subtree: true });
 };
 
-if (document.readyState === "loading") {
-	// Loading hasn't finished yet
-	document.addEventListener("DOMContentLoaded", init);
-} else {
-	// `DOMContentLoaded` has already fired
-	init().catch((error) => {
-		console.error("Error initializing:", error);
+const initIframe = async () => {
+	const iframe = document.createElement("iframe");
+	iframe.id = "my-iframe";
+
+	// Set the src attribute to the URL of worker.html.
+	iframe.src = chrome.runtime.getURL("src/worker/worker.html");
+
+	// Append the iframe to the DOM.
+	document.body.appendChild(iframe);
+
+	// Wait for the iframe to load.
+	await new Promise((resolve) => {
+		iframe.onload = resolve;
 	});
+
+	// Get the iframe's window object.
+
+	iframeWindow = iframe.contentWindow;
+};
+
+if (document.readyState === "loading") {
+	document.addEventListener("DOMContentLoaded", async () => {
+		try {
+			await initIframe();
+			await init();
+		} catch (error) {
+			console.error("Error initializing:", error);
+		}
+	});
+} else {
+	initIframe()
+		.then(init)
+		.catch((error) => {
+			console.error("Error initializing:", error);
+		});
 }
+
+// Listen for messages from the worker.
+window.addEventListener("message", (event) => {
+	console.log("message received from iframe", event);
+	// if (event.source !== iframeWindow) return;
+	// receiveMessage(event);
+});
